@@ -5,7 +5,8 @@ from pathlib import Path
 import re
 
 import pefile
-from iced_x86 import Code as C, Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import (Code as C, Decoder, EncodingKind, FlowControl, MemorySizeExt, Mnemonic as M, OpKind as K,
+                      Register as R, RegisterExt, RflagsBits as F)
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -380,6 +381,53 @@ def mxcsr_entry(name, inner):
             f"    return result;\n}}\n")
 
 
+# LAHF loads SF, ZF, AF, PF and CF into AH. The lowering keeps AF and PF only where a LAHF reads them, and only
+# from the writers that define both from their operands and result.
+LAHF_FLAGS = F.SF | F.ZF | F.AF | F.PF | F.CF
+LAHF_WRITERS = frozenset({M.ADD, M.SUB, M.CMP})
+
+
+def lahf_sources(body):
+    """The ips of the instructions whose flags a LAHF of body reads. Each LAHF must follow, in the same
+    straight-line block, a register ADD, SUB or CMP (register or immediate source) that is the last writer of
+    any status flag before it. A function entry, a branch target, a branch, a call or any other flag writer
+    between the two is refused, so every flag LAHF reads is defined by that writer at the use."""
+    if not any(i.mnemonic == M.LAHF for i in body):
+        return set()
+    targets = {i.near_branch_target for i in body
+               if i.flow_control in (FlowControl.CONDITIONAL_BRANCH, FlowControl.UNCONDITIONAL_BRANCH)}
+    indirect = any(i.flow_control == FlowControl.INDIRECT_BRANCH for i in body)
+    sources = set()
+    for k, i in enumerate(body):
+        if i.mnemonic != M.LAHF:
+            continue
+        where = f"unsupported query operation at {i.ip:#x}: {i}"
+        if indirect:
+            raise ValueError(f"{where} in a function with an indirect branch, whose joins are not known")
+        if i.ip in targets:
+            raise ValueError(f"{where} at a branch target, where the flags come from more than one path")
+        for j in range(k - 1, -1, -1):
+            prev = body[j]
+            if prev.next_ip != body[j + 1].ip:
+                raise ValueError(f"{where} after a gap in the function body at {prev.ip:#x}")
+            if prev.flow_control != FlowControl.NEXT:
+                raise ValueError(f"{where} reads flags across {prev} at {prev.ip:#x}")
+            if prev.rflags_modified & LAHF_FLAGS:
+                if (prev.mnemonic in LAHF_WRITERS and prev.op0_kind == K.REGISTER
+                        and prev.op1_kind in (K.REGISTER, K.IMMEDIATE8, K.IMMEDIATE16, K.IMMEDIATE32,
+                                              K.IMMEDIATE8TO16, K.IMMEDIATE8TO32, K.IMMEDIATE8TO64,
+                                              K.IMMEDIATE32TO64)):
+                    sources.add(prev.ip)
+                    break
+                raise ValueError(f"{where} reads AF and PF after {prev} at {prev.ip:#x}; only a register ADD, "
+                                 "SUB or CMP defines them for LAHF")
+            if prev.ip in targets:
+                raise ValueError(f"{where} reads flags across the branch target {prev.ip:#x}")
+        else:
+            raise ValueError(f"{where} reads flags that no instruction of its block defines")
+    return sources
+
+
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False,
           host_cpu=False, host_mxcsr=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
@@ -396,6 +444,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP, M.FCMOVU, M.FCMOVNU) for i in body)
     if parity:
         lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
+    # A register ADD, SUB or CMP that a LAHF reads also assigns AF and PF (lahf_sources).
+    lahf_from = lahf_sources(body)
+    if lahf_from:
+        lines[2] = lines[2][:-1] + ("" if parity else ", parity=false") + ", aux=false;"
     # FNSTSW is the only reader of the x87 status word (x87_lower.statement).
     status_word = x87_depth is not None and any(i.mnemonic == M.FNSTSW for i in body)
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
@@ -781,6 +833,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             if target not in allowed:
                 raise ValueError(f"unbound branch at {i.ip:#x}")
             stmt = f"if ({'' if op == M.JP else '!'}parity) goto block_{target:x};"
+        elif op == M.LAHF:  # AH = SF:ZF:0:AF:0:PF:1:CF; the rest of RAX is unchanged
+            stmt = ("rax = (rax & ~0xff00ull) | (word(sign) << 15) | (word(zero) << 14) | (word(aux) << 12) | "
+                    "(word(parity) << 10) | 0x200ull | (word(carry) << 8);")
         elif op == M.SAHF and x87_depth is not None:
             # CF, PF and ZF from bits 0, 2 and 6 of AH; SF from bit 7; AF is not modelled.
             stmt = ("{ const uint8_t h = static_cast<uint8_t>(rax >> 8); carry = (h & 1) != 0; zero = (h & 0x40) != 0; sign = (h & 0x80) != 0;"
@@ -834,7 +889,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}), "
                     f"d = static_cast<{width}>(a - b); "
                     f"zero = a == b; carry = a < b; overflow = (((a ^ b) & (a ^ d)) >> {8 * size - 1}) != 0; "
-                    f"sign = ((d >> {8 * size - 1}) & 1) != 0; }}")
+                    f"sign = ((d >> {8 * size - 1}) & 1) != 0;"
+                    + (f" aux = ((a ^ b ^ d) & 0x10u) != 0; {x87_lower.parity_statement('d')}" if i.ip in lahf_from else "")
+                    + " }")
         elif op == M.TEST and parity and x87_lower.assigns_parity(i):
             stmt = (f"{{ const uint8_t v = static_cast<uint8_t>({operand(0)} & {operand(1)}); zero = v == 0; "
                     f"carry = false; overflow = false; sign = (v & 0x80u) != 0; {x87_lower.parity_statement('v')} }}")
@@ -969,6 +1026,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             update += f" sign = ((v >> {sign_shift}) & 1) != 0;"
             if op == M.AND and parity and x87_lower.assigns_parity(i):
                 update += " " + x87_lower.parity_statement("v")
+            if i.ip in lahf_from:  # ADD or SUB (lahf_sources)
+                update += f" aux = ((a ^ b ^ v) & 0x10u) != 0; {x87_lower.parity_statement('v')}"
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
         elif op in (M.ADCX, M.ADOX) and RegisterExt.size(i.op0_register) in (4, 8):

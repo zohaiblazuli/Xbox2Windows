@@ -1,0 +1,21 @@
+EXPORTS
+    lahf_add64
+    lahf_add32
+    lahf_add16
+    lahf_add8
+    lahf_sub64
+    lahf_sub32
+    lahf_sub16
+    lahf_sub8
+    lahf_cmp64
+    lahf_cmp32
+    lahf_cmp16
+    lahf_cmp8
+    lahf_add_imm8
+    lahf_sub_imm32
+    lahf_cmp_imm8
+    lahf_add_rax
+    lahf_cmp_ah
+    lahf_sub_al
+    lahf_moves_between
+    lahf_consumer
